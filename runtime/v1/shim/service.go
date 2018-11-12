@@ -24,8 +24,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
+	oslog "log"
+	//ostime "time"
 
 	"github.com/containerd/console"
 	eventstypes "github.com/containerd/containerd/api/events"
@@ -72,6 +75,12 @@ type Config struct {
 
 // NewService returns a new shim service that can be used via GRPC
 func NewService(config Config, publisher events.Publisher) (*Service, error) {
+	f, err := os.OpenFile("/tmp/containerd.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		oslog.Fatal(err)
+	}
+	oslog.SetOutput(f)
+
 	if config.Namespace == "" {
 		return nil, fmt.Errorf("shim namespace cannot be empty")
 	}
@@ -114,6 +123,7 @@ type Service struct {
 
 // Create a new initial process and container with the underlying OCI runtime
 func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *shimapi.CreateTaskResponse, err error) {
+
 	var mounts []proc.Mount
 	for _, m := range r.Rootfs {
 		mounts = append(mounts, proc.Mount{
@@ -159,6 +169,15 @@ func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	oslog.Printf("s.config = %q\n", s.config)
+	ch := make(chan error)
+	go bbfsMountContainerRootfs(r.Bundle, ch)
+	if err := <-ch; err != nil {
+		return nil, err
+	}
+	oslog.Printf("bbfs mount succceeded\n")
+	//ostime.Sleep(10000*ostime.Second)
+
 	process, err := newInit(
 		ctx,
 		s.config.Path,
@@ -170,6 +189,7 @@ func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *
 		s.platform,
 		config,
 	)
+
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -184,6 +204,53 @@ func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *
 	return &shimapi.CreateTaskResponse{
 		Pid: uint32(pid),
 	}, nil
+}
+
+func getRootPath(bundlePath string) string {
+	var bundleSpec specs.Spec
+	bundleConfigContents, err := ioutil.ReadFile(filepath.Join(bundlePath, "config.json"))
+	if err != nil {
+		return ""
+	}
+	json.Unmarshal(bundleConfigContents, &bundleSpec)
+	return bundleSpec.Root.Path
+}
+
+func writeRootPath(bundlePath, destDir string) {
+	var bundleSpec specs.Spec
+	bundleConfigContents, err := ioutil.ReadFile(filepath.Join(bundlePath, "config.json"))
+	if err != nil {
+		return
+	}
+	json.Unmarshal(bundleConfigContents, &bundleSpec)
+	bundleSpec.Root.Path = destDir
+
+	bundleSpecJson, _ := json.Marshal(bundleSpec)
+	ioutil.WriteFile(filepath.Join(bundlePath, "config.json"), bundleSpecJson, 0644)
+}
+
+func bbfsMountContainerRootfs(bundle string, c chan error) {
+
+	sourceDir, _ := filepath.EvalSymlinks(getRootPath(bundle))
+	destDir, _ := filepath.EvalSymlinks(filepath.Join(bundle, "rootfs"))
+	writeRootPath(bundle, destDir)
+	pidFile := filepath.Join(bundle, "init.pid")
+
+	binary, err := exec.LookPath("bb-fuse")
+	if err != nil {
+		c <-err
+		return
+	}
+
+	cmd := exec.Command(binary, "-pidfile", pidFile, destDir, sourceDir)
+	if err = cmd.Start(); err != nil {
+		c <-err
+		return
+	}
+
+	c <-nil
+	cmd.Wait()
+	oslog.Printf("bb-fuse process is terminated\n")
 }
 
 // Start a process
